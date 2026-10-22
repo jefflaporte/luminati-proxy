@@ -3,10 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/build-image-optimized.sh <amd64|arm64> [--no-chrome] [--dry-run] [--check] [--] [buildx options...]
+Usage: scripts/build-image-optimized.sh <amd64|arm64> [debian|alpine] [--no-chrome] [--dry-run] [--check] [--] [buildx options...]
 
 Build and load one optimized image locally for the requested architecture.
-By default, AMD64 includes Puppeteer's Chrome and ARM64 includes Debian Chromium.
+The distribution defaults to debian. Debian AMD64 includes Puppeteer's Chrome;
+Debian ARM64 and both Alpine architectures use native Chromium packages.
 SSL analysis and the HAR viewer remain included with --no-chrome. Requires Docker
 with Buildx; no host npm.
 
@@ -19,12 +20,12 @@ Environment:
   LPM_VERSION   Published npm version (default: this checkout's package.json).
   NODE_VERSION  Node image version (default: the original Dockerfile's pinned version).
   IMAGE_TAG     Local image tag (default: luminati-proxy:<LPM_VERSION>-optimized,
-                or luminati-proxy:<LPM_VERSION>-optimized-no-chrome with --no-chrome).
+                with -alpine for Alpine and -no-chrome when the browser is omitted).
 
 Examples:
   scripts/build-image-optimized.sh arm64 --dry-run
-  scripts/build-image-optimized.sh amd64 --check
-  scripts/build-image-optimized.sh arm64 --no-chrome
+  scripts/build-image-optimized.sh amd64 debian --check
+  scripts/build-image-optimized.sh arm64 alpine --no-chrome
   scripts/build-image-optimized.sh arm64 -- --no-cache
   IMAGE_TAG=luminati-proxy:comparison-arm64 scripts/build-image-optimized.sh arm64
 
@@ -38,6 +39,7 @@ dry_run=false
 check_only=false
 with_chrome=true
 architecture=""
+distribution=""
 while (($#)); do
     case "$1" in
         --no-chrome) with_chrome=false; shift ;;
@@ -50,8 +52,17 @@ while (($#)); do
                 exit 2
             fi
             architecture="$1"; shift ;;
+        debian|alpine)
+            if [[ -n "$distribution" ]]; then
+                printf 'Specify at most one distribution: debian or alpine.\n' >&2
+                exit 2
+            fi
+            distribution="$1"; shift ;;
         --) shift; break ;;
-        *) break ;;
+        -*) break ;;
+        *)
+            printf 'Unsupported argument: %s. Use amd64|arm64 and debian|alpine.\n' "$1" >&2
+            exit 2 ;;
     esac
 done
 
@@ -60,6 +71,7 @@ if [[ -z "$architecture" ]]; then
     usage >&2
     exit 2
 fi
+distribution="${distribution:-debian}"
 
 for option in "$@"; do
     case "$option" in
@@ -90,13 +102,18 @@ if [[ -z "$node_version" || "$node_version" == *$'\n'* ]]; then
 fi
 
 image_suffix=optimized
+dockerfile="$repo_root/Dockerfile.optimized"
+if [[ "$distribution" == alpine ]]; then
+    dockerfile="$repo_root/Dockerfile.optimized.alpine"
+    image_suffix+=-alpine
+fi
 if [[ "$with_chrome" == false ]]; then
     image_suffix+=-no-chrome
 fi
 image_tag="${IMAGE_TAG:-luminati-proxy:${lpm_version}-${image_suffix}}"
 build_command=(docker buildx build
     --platform "linux/$architecture"
-    --file "$repo_root/Dockerfile.optimized"
+    --file "$dockerfile"
     --build-arg "LPM_VERSION=$lpm_version"
     --build-arg "NODE_VERSION=$node_version"
     --build-arg "WITH_CHROME=$with_chrome")

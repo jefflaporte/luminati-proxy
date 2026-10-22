@@ -1,0 +1,5 @@
+# Install the published npm package; only the public CA bundle enters the context.
+**
+!Dockerfile.optimized.alpine
+!docker/
+!docker/prisma_brightdata_ca.crt
