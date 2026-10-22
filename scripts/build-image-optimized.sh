@@ -3,12 +3,14 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: scripts/build-image-optimized.sh <amd64|arm64> [--dry-run] [--check] [--] [buildx options...]
+Usage: scripts/build-image-optimized.sh <amd64|arm64> [--no-chrome] [--dry-run] [--check] [--] [buildx options...]
 
 Build and load one optimized image locally for the requested architecture.
-AMD64 retains Puppeteer's Chrome; ARM64 uses native Debian Chromium. SSL analysis
-and the HAR viewer remain included. Requires Docker with Buildx; no host npm.
+By default, AMD64 includes Puppeteer's Chrome and ARM64 includes Debian Chromium.
+SSL analysis and the HAR viewer remain included with --no-chrome. Requires Docker
+with Buildx; no host npm.
 
+  --no-chrome Omit the browser and GUI libraries; Browser action unavailable.
   --dry-run   Print the command without contacting Docker or building an image.
   --check     Run Dockerfile checks without executing build steps or loading an image.
   --help      Show this help.
@@ -16,11 +18,13 @@ and the HAR viewer remain included. Requires Docker with Buildx; no host npm.
 Environment:
   LPM_VERSION   Published npm version (default: this checkout's package.json).
   NODE_VERSION  Node image version (default: the original Dockerfile's pinned version).
-  IMAGE_TAG     Local image tag (default: luminati-proxy:<LPM_VERSION>-optimized).
+  IMAGE_TAG     Local image tag (default: luminati-proxy:<LPM_VERSION>-optimized,
+                or luminati-proxy:<LPM_VERSION>-optimized-no-chrome with --no-chrome).
 
 Examples:
   scripts/build-image-optimized.sh arm64 --dry-run
   scripts/build-image-optimized.sh amd64 --check
+  scripts/build-image-optimized.sh arm64 --no-chrome
   scripts/build-image-optimized.sh arm64 -- --no-cache
   IMAGE_TAG=luminati-proxy:comparison-arm64 scripts/build-image-optimized.sh arm64
 
@@ -32,9 +36,11 @@ EOF
 
 dry_run=false
 check_only=false
+with_chrome=true
 architecture=""
 while (($#)); do
     case "$1" in
+        --no-chrome) with_chrome=false; shift ;;
         --dry-run) dry_run=true; shift ;;
         --check) check_only=true; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -83,12 +89,17 @@ if [[ -z "$node_version" || "$node_version" == *$'\n'* ]]; then
     exit 1
 fi
 
-image_tag="${IMAGE_TAG:-luminati-proxy:${lpm_version}-optimized}"
+image_suffix=optimized
+if [[ "$with_chrome" == false ]]; then
+    image_suffix+=-no-chrome
+fi
+image_tag="${IMAGE_TAG:-luminati-proxy:${lpm_version}-${image_suffix}}"
 build_command=(docker buildx build
     --platform "linux/$architecture"
     --file "$repo_root/Dockerfile.optimized"
     --build-arg "LPM_VERSION=$lpm_version"
-    --build-arg "NODE_VERSION=$node_version")
+    --build-arg "NODE_VERSION=$node_version"
+    --build-arg "WITH_CHROME=$with_chrome")
 
 if [[ "$check_only" == true ]]; then
     build_command+=(--check)

@@ -1,30 +1,40 @@
 # syntax=docker/dockerfile:1
 # check=skip=InvalidDefaultArgInFrom
 
-# Retains a native browser and the published image's TLS settings.
+# Retains the published image's TLS settings; a native browser is optional.
 # AMD64 uses Puppeteer's Chrome; ARM64 uses Debian Chromium. See docker/README.optimized.md.
 # The build script supplies version arguments; NODE_VERSION has no default.
 ARG NODE_VERSION
+ARG WITH_CHROME=true
 
 FROM node:${NODE_VERSION}-bookworm AS dependencies
 ARG TARGETARCH
 ARG LPM_VERSION
+ARG WITH_CHROME
 
 ENV PUPPETEER_CACHE_DIR=/opt/puppeteer \
+    PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD=true \
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/prisma_brightdata_ca.pem \
     OPENSSL_CONF=/etc/ssl/openssl.cnf
 
 COPY docker/prisma_brightdata_ca.crt /usr/local/share/ca-certificates/
 
 # Build native addons for the selected platform. Puppeteer's pinned Linux ARM64
-# download resolves to an AMD64 browser, so only AMD64 downloads browsers here.
+# download resolves to an AMD64 browser. Only browser-enabled AMD64 builds download
+# Chrome; no variant needs the separate Headless Shell.
 RUN set -eu; \
     : "${LPM_VERSION:?LPM_VERSION is required; use scripts/build-image-optimized.sh}"; \
     case "$TARGETARCH" in \
-        amd64) ;; \
-        arm64) export PUPPETEER_SKIP_DOWNLOAD=true ;; \
+        amd64|arm64) ;; \
         *) printf 'Unsupported architecture: %s\n' "$TARGETARCH" >&2; exit 1 ;; \
     esac; \
+    case "$WITH_CHROME" in \
+        true|false) ;; \
+        *) printf 'WITH_CHROME must be true or false.\n' >&2; exit 1 ;; \
+    esac; \
+    if [ "$WITH_CHROME" = false ] || [ "$TARGETARCH" = arm64 ]; then \
+        export PUPPETEER_SKIP_DOWNLOAD=true; \
+    fi; \
     update-ca-certificates; \
     { printf '%s\n' 'nodejs_conf = openssl_init'; \
          cat /etc/ssl/openssl.cnf; \
@@ -40,23 +50,17 @@ RUN set -eu; \
     test -s /usr/local/lib/node_modules/@luminati-io/luminati-proxy/bin/pub/index.html; \
     node -e 'const fs = require("node:fs"); \
         const p = require("/usr/local/lib/node_modules/@luminati-io/luminati-proxy/node_modules/puppeteer"); \
-        if (process.arch === "x64") fs.accessSync(p.executablePath(), fs.constants.X_OK)'
+        if (process.env.WITH_CHROME === "true" && process.arch === "x64") \
+            fs.accessSync(p.executablePath(), fs.constants.X_OK)'
 
 FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 
 COPY docker/prisma_brightdata_ca.crt /usr/local/share/ca-certificates/
 
-# Retain upstream browser libraries; explicitly include dependencies that the
-# full Node base or APT recommendations previously supplied. Clean APT in-place.
+# The proxy-only runtime needs no browser GUI libraries.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        ca-certificates curl fonts-liberation gconf-service \
-        libappindicator1 libasound2 libatk-bridge2.0-0 libatk1.0-0 \
-        libcairo2 libcups2 libdbus-1-3 libfontconfig1 libgbm1 \
-        libgdk-pixbuf2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
-        libstdc++6 libudev1 libx11-xcb1 libxcb1 libxcomposite1 \
-        libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 libxss1 \
-        lsb-release openssl procps xdg-utils \
+        ca-certificates curl libstdc++6 lsb-release openssl procps \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -66,6 +70,8 @@ COPY --from=dependencies /opt/puppeteer /opt/puppeteer
 
 ENV DOCKER=1 \
     PUPPETEER_CACHE_DIR=/opt/puppeteer \
+    PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_CHROME_HEADLESS_SHELL_SKIP_DOWNLOAD=true \
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/prisma_brightdata_ca.pem \
     OPENSSL_CONF=/etc/ssl/openssl.cnf
 
@@ -76,44 +82,63 @@ RUN set -eu; \
             "/usr/local/bin/$command"; \
     done
 
-FROM runtime AS browser-amd64
+FROM runtime AS browser-libraries
 
-FROM runtime AS browser-arm64
+# Current Chrome uses GTK3. Omit the legacy GConf/AppIndicator/GTK2 chain.
+# These libraries never enter the browser-free image's layers.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends chromium chromium-headless-shell \
+    && apt-get install --yes --no-install-recommends \
+        fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+        libcairo2 libcups2 libdbus-1-3 libfontconfig1 libgbm1 \
+        libgdk-pixbuf2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+        libudev1 libx11-xcb1 libxcb1 libxcomposite1 \
+        libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 libxss1 xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM browser-libraries AS browser-amd64
+
+FROM browser-libraries AS browser-arm64
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends chromium \
     && rm -rf /var/lib/apt/lists/*
 
 # Use the native system browser without changing the application or downloading
 # an incompatible Chrome binary on first launch.
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-FROM browser-${TARGETARCH} AS optimized
+FROM browser-${TARGETARCH} AS browser-true
+
+FROM runtime AS browser-false
+
+# BuildKit skips the browser-only stages entirely when WITH_CHROME=false.
+FROM browser-${WITH_CHROME} AS optimized
 ARG TARGETARCH
+ARG WITH_CHROME
 
 # Fail a future build if the selected browser is unavailable or if native
 # browser/addon libraries are unresolved. Debian's /usr/bin/chromium is a shell
 # wrapper, so check the real ELF binaries on ARM64.
 RUN set -eu; \
-    node -e 'const fs = require("node:fs"); \
-        const p = require("/usr/local/lib/node_modules/@luminati-io/luminati-proxy/node_modules/puppeteer"); \
-        const executable = p.executablePath(); \
-        fs.accessSync(executable, fs.constants.X_OK); \
-        process.stdout.write(executable)' > /tmp/chrome-path; \
-    case "$TARGETARCH" in \
-        amd64) \
-            ldd "$(cat /tmp/chrome-path)" > /tmp/runtime-libraries; \
-            find /opt/puppeteer -type f -name chrome-headless-shell \
-                -exec ldd '{}' \; >> /tmp/runtime-libraries ;; \
-        arm64) \
-            ldd /usr/lib/chromium/chromium > /tmp/runtime-libraries; \
-            ldd /usr/lib/chromium/chromium-headless-shell >> /tmp/runtime-libraries ;; \
-    esac; \
+    : > /tmp/runtime-libraries; \
+    if [ "$WITH_CHROME" = true ]; then \
+        node -e 'const fs = require("node:fs"); \
+            const p = require("/usr/local/lib/node_modules/@luminati-io/luminati-proxy/node_modules/puppeteer"); \
+            const executable = p.executablePath(); \
+            fs.accessSync(executable, fs.constants.X_OK); \
+            process.stdout.write(executable)' > /tmp/chrome-path; \
+        case "$TARGETARCH" in \
+            amd64) ldd "$(cat /tmp/chrome-path)" >> /tmp/runtime-libraries ;; \
+            arm64) ldd /usr/lib/chromium/chromium >> /tmp/runtime-libraries ;; \
+        esac; \
+    else \
+        test -z "$(find /opt/puppeteer -type f -print -quit)"; \
+        test ! -e /usr/bin/chromium; \
+    fi; \
     find /usr/local/lib/node_modules/@luminati-io/luminati-proxy \
         -type f -name '*.node' -exec ldd '{}' \; >> /tmp/runtime-libraries; \
     if grep -q 'not found' /tmp/runtime-libraries; then \
         cat /tmp/runtime-libraries; exit 1; \
     fi; \
-    rm /tmp/chrome-path /tmp/runtime-libraries
+    rm -f /tmp/chrome-path /tmp/runtime-libraries
 
 CMD ["luminati", "--help"]

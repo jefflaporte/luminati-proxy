@@ -321,7 +321,7 @@ Options:
 
 A docker image can be found on [https://hub.docker.com/r/luminati/luminati-proxy/](https://hub.docker.com/r/luminati/luminati-proxy/)
 
-For a smaller image with AMD64 and ARM64 build options, see the
+For a smaller image with AMD64, ARM64, and optional browser support, see the
 [optimized Docker image instructions](docker/README.optimized.md).
 
 ```sh

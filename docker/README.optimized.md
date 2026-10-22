@@ -4,17 +4,20 @@
 npm package. The original Dockerfile and application source are unchanged.
 Like the original Dockerfile, it does **not** build the local application source.
 
-The build supports `linux/amd64` and `linux/arm64`. Both retain a native browser,
-the web UI/HAR viewer, SSL analysis, all four CLI aliases, root user, and the
-upstream default command (`luminati --help`).
+The build supports `linux/amd64` and `linux/arm64`. Both retain the web UI/HAR
+viewer, SSL analysis, all four CLI aliases, root user, and the upstream default
+command (`luminati --help`). A native browser is included by default and can be
+omitted with `--no-chrome`.
 
 | Architecture | Browser |
 | --- | --- |
-| `amd64` | Puppeteer's pinned Chrome and Chrome Headless Shell downloads, as before. |
-| `arm64` | Debian's native Chromium and Chromium Headless Shell packages. |
+| `amd64` | Puppeteer's pinned Chrome download. |
+| `arm64` | Debian's native Chromium package. |
 
-Both browser variants are retained for compatibility. Whether the separate
-Headless Shell can be omitted has not been assessed.
+The separate Chrome Headless Shell is omitted on both architectures. The
+application's browser action launches full Chrome with `headless: false`; no
+application call selects Puppeteer's `headless: 'shell'` mode. Full Chrome can
+also run in its normal headless mode.
 
 The pinned Puppeteer version maps Linux ARM64 browser downloads to AMD64 binaries.
 ARM64 therefore skips those downloads and sets `PUPPETEER_EXECUTABLE_PATH` to
@@ -22,6 +25,17 @@ ARM64 therefore skips those downloads and sets `PUPPETEER_EXECUTABLE_PATH` to
 without modifying application code. Debian's browser version can differ from
 Puppeteer's pinned Chrome, so ARM64 browser automation compatibility needs runtime
 validation. SSL analysis/HAR capture is implemented separately in Node.
+
+The browser action launches Chrome inside the container and requires a working
+graphical display, such as a forwarded X server. The image provides no display
+server or browser streaming service.
+
+With `--no-chrome`, neither Chrome/Chromium nor its GUI libraries are included.
+Proxying, SSL analysis, and the HAR viewer remain available. The web UI's
+**Browser** action cannot launch a browser in this variant. Runtime browser
+downloads are disabled in both variants, so using that action does not silently
+install Chrome into a browser-free container. The Puppeteer JavaScript package
+remains installed because the application imports it at startup.
 
 ## Build
 
@@ -34,12 +48,21 @@ From the repository root, with Docker and Buildx installed:
 
 # Or build the existing AMD64 variant:
 ./scripts/build-image-optimized.sh amd64
+
+# Omit Chrome and its GUI libraries, retaining SSL analysis and HAR:
+./scripts/build-image-optimized.sh arm64 --no-chrome
+
+# Validate that variant without building:
+./scripts/build-image-optimized.sh arm64 --no-chrome --check
 ```
 
 The architecture argument is required and selects `--platform linux/amd64` or
 `--platform linux/arm64`. Both use the default tag
-`luminati-proxy:1.679.135-optimized` for this checkout. Separate local builds do
-not automatically combine the architectures under a multi-platform manifest.
+`luminati-proxy:1.679.135-optimized` for this checkout. With `--no-chrome`, the tag
+is `luminati-proxy:1.679.135-optimized-no-chrome`, keeping the two feature variants
+separate. Architecture is expressed through `--platform`, without an architecture
+suffix in either tag. Separate local builds do not automatically combine the
+architectures under a multi-platform manifest.
 Use different `IMAGE_TAG` values when keeping comparison builds side by side.
 For a future registry release, publish a multi-platform manifest under the
 shared tag so Docker can select the appropriate architecture when pulling.
@@ -72,6 +95,10 @@ and `--build-arg NODE_VERSION=<version>` and select the platform with
 intentionally has no application or Node version defaults; the script supplies
 them from the existing upstream files.
 
+The Dockerfile defaults to `WITH_CHROME=true`. For a direct browser-free build,
+also pass `--build-arg WITH_CHROME=false`. BuildKit skips the browser-only stages
+entirely, so their packages do not enter the browser-free image's layers.
+
 Top-level versions are pinned; the upstream npm package has no committed lockfile
 here, so transitive npm dependencies and Debian packages can still change.
 
@@ -82,32 +109,49 @@ Reported local image sizes for Proxy Manager 1.679.135:
 | Image | Local size | Reduction from the published image |
 | --- | --- | --- |
 | Published upstream, AMD64 | 4.81 GB | — |
-| Optimized, AMD64 | 1.78 GB | About 63% |
-| Optimized, ARM64 | 1.96 GB | About 59% |
+| Initial optimized build, AMD64 | 1.78 GB | About 63% |
+| Initial optimized build, ARM64 | 1.96 GB | About 59% |
+| Current optimized build, ARM64, `--no-chrome` | 666.5 MB | About 86% |
 
 These figures describe local image storage; registry download sizes differ.
+The initial optimized builds predate the removal of Headless Shell and the legacy
+GConf/AppIndicator/GTK2 packages. Current browser-enabled sizes have not yet been
+measured.
 
 - A full Node builder compiles native dependencies, while the final image uses
   `node:24.13.0-bookworm-slim` and browser/runtime libraries.
 - The application is installed once with production dependencies. Compilers,
   Node build headers, the builder's npm cache, and its npm upgrade stay out of
   the final image.
-- AMD64 retains both Puppeteer browser downloads in `/opt/puppeteer`, outside the
-  `/root` directory used by existing configuration volumes. ARM64 installs its
-  two native Chromium packages in the runtime stage instead.
+- AMD64 retains only Puppeteer's full Chrome download in `/opt/puppeteer`, outside
+  the `/root` directory used by existing configuration volumes. Its separate
+  Headless Shell download is disabled. ARM64 installs Chromium without the
+  `chromium-headless-shell` package.
+- The legacy `gconf-service` and `libappindicator1` packages are omitted, avoiding
+  their GConf/GTK2 dependency chain while retaining the GTK3 libraries used by
+  current Chrome.
+- With `--no-chrome`, browser downloads, Chromium installation, fonts, and the
+  browser GUI library stages are all omitted.
 - APT metadata is removed in the same layer that installs the runtime packages,
   and recommended packages are not installed.
 - The extra Google Chrome `.deb` download/install/delete steps are omitted.
   The inspected published image had no installed `google-chrome-stable` package;
-  its browser payload came from the two Puppeteer downloads retained here.
+  its browser payload came from Puppeteer downloads.
 
-The build checks for bundled UI assets, the selected Puppeteer executable, and
-unresolved shared libraries in Chrome and native addons. Runtime compatibility
-still needs validation after a real build.
+The build checks for bundled UI assets and unresolved shared libraries in native
+addons. Browser-enabled builds also check the Puppeteer executable and its shared
+libraries. Browser-free builds check that the browser cache is empty and no system
+Chromium executable is present.
+
+The built ARM64 browser-free image passed a CLI startup check; Chromium and the
+GTK2/GTK3/GConf/AppIndicator packages were confirmed absent. A disposable ARM64
+container also launched full Chromium and rendered HTML after Headless Shell and
+the legacy packages were removed. End-to-end proxying, SSL analysis, and HAR checks
+remain outstanding.
 
 ## Existing TLS settings
 
-This first packaging change preserves the inspected published image's additional
+This packaging preserves the inspected published image's additional
 trust bundle and `UnsafeLegacyRenegotiation` OpenSSL setting. Changing those is a
 separate compatibility decision. They are configured explicitly here because
 they are absent from the upstream public Dockerfile.
