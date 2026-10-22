@@ -1,0 +1,6 @@
+# This Dockerfile installs the published npm package, matching the upstream build.
+# Only its extra public CA bundle needs to enter the build context.
+**
+!Dockerfile.optimized
+!docker/
+!docker/prisma_brightdata_ca.crt

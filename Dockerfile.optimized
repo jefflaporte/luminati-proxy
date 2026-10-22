@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1
+# check=skip=InvalidDefaultArgInFrom
+
+# Retains a native browser and the published image's TLS settings.
+# AMD64 uses Puppeteer's Chrome; ARM64 uses Debian Chromium. See docker/README.optimized.md.
+# The build script supplies version arguments; NODE_VERSION has no default.
+ARG NODE_VERSION
+
+FROM node:${NODE_VERSION}-bookworm AS dependencies
+ARG TARGETARCH
+ARG LPM_VERSION
+
+ENV PUPPETEER_CACHE_DIR=/opt/puppeteer \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/prisma_brightdata_ca.pem \
+    OPENSSL_CONF=/etc/ssl/openssl.cnf
+
+COPY docker/prisma_brightdata_ca.crt /usr/local/share/ca-certificates/
+
+# Build native addons for the selected platform. Puppeteer's pinned Linux ARM64
+# download resolves to an AMD64 browser, so only AMD64 downloads browsers here.
+RUN set -eu; \
+    : "${LPM_VERSION:?LPM_VERSION is required; use scripts/build-image-optimized.sh}"; \
+    case "$TARGETARCH" in \
+        amd64) ;; \
+        arm64) export PUPPETEER_SKIP_DOWNLOAD=true ;; \
+        *) printf 'Unsupported architecture: %s\n' "$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    update-ca-certificates; \
+    { printf '%s\n' 'nodejs_conf = openssl_init'; \
+         cat /etc/ssl/openssl.cnf; \
+         printf '\n%s\n' '[openssl_init]' 'ssl_conf = ssl_sect' \
+             '[ssl_sect]' 'system_default = system_default_sect' \
+             '[system_default_sect]' 'Options = UnsafeLegacyRenegotiation'; \
+    } > /tmp/openssl.cnf; \
+    mv /tmp/openssl.cnf /etc/ssl/openssl.cnf; \
+    npm install --global npm@10.9.2; \
+    npm install --global --omit=dev --legacy-peer-deps \
+        "@luminati-io/luminati-proxy@${LPM_VERSION}"; \
+    mkdir -p /opt/puppeteer; \
+    test -s /usr/local/lib/node_modules/@luminati-io/luminati-proxy/bin/pub/index.html; \
+    node -e 'const fs = require("node:fs"); \
+        const p = require("/usr/local/lib/node_modules/@luminati-io/luminati-proxy/node_modules/puppeteer"); \
+        if (process.arch === "x64") fs.accessSync(p.executablePath(), fs.constants.X_OK)'
+
+FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+
+COPY docker/prisma_brightdata_ca.crt /usr/local/share/ca-certificates/
+
+# Retain upstream browser libraries; explicitly include dependencies that the
+# full Node base or APT recommendations previously supplied. Clean APT in-place.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates curl fonts-liberation gconf-service \
+        libappindicator1 libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+        libcairo2 libcups2 libdbus-1-3 libfontconfig1 libgbm1 \
+        libgdk-pixbuf2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+        libstdc++6 libudev1 libx11-xcb1 libxcb1 libxcomposite1 \
+        libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 libxss1 \
+        lsb-release openssl procps xdg-utils \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=dependencies /etc/ssl/openssl.cnf /etc/ssl/openssl.cnf
+COPY --from=dependencies /usr/local/lib/node_modules/@luminati-io/luminati-proxy /usr/local/lib/node_modules/@luminati-io/luminati-proxy
+COPY --from=dependencies /opt/puppeteer /opt/puppeteer
+
+ENV DOCKER=1 \
+    PUPPETEER_CACHE_DIR=/opt/puppeteer \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/prisma_brightdata_ca.pem \
+    OPENSSL_CONF=/etc/ssl/openssl.cnf
+
+# Preserve all upstream CLI names.
+RUN set -eu; \
+    for command in luminati luminati-proxy pmgr proxy-manager; do \
+        ln -s ../lib/node_modules/@luminati-io/luminati-proxy/bin/index.js \
+            "/usr/local/bin/$command"; \
+    done
+
+FROM runtime AS browser-amd64
+
+FROM runtime AS browser-arm64
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends chromium chromium-headless-shell \
+    && rm -rf /var/lib/apt/lists/*
+
+# Use the native system browser without changing the application or downloading
+# an incompatible Chrome binary on first launch.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    PUPPETEER_SKIP_DOWNLOAD=true
+
+FROM browser-${TARGETARCH} AS optimized
+ARG TARGETARCH
+
+# Fail a future build if the selected browser is unavailable or if native
+# browser/addon libraries are unresolved. Debian's /usr/bin/chromium is a shell
+# wrapper, so check the real ELF binaries on ARM64.
+RUN set -eu; \
+    node -e 'const fs = require("node:fs"); \
+        const p = require("/usr/local/lib/node_modules/@luminati-io/luminati-proxy/node_modules/puppeteer"); \
+        const executable = p.executablePath(); \
+        fs.accessSync(executable, fs.constants.X_OK); \
+        process.stdout.write(executable)' > /tmp/chrome-path; \
+    case "$TARGETARCH" in \
+        amd64) \
+            ldd "$(cat /tmp/chrome-path)" > /tmp/runtime-libraries; \
+            find /opt/puppeteer -type f -name chrome-headless-shell \
+                -exec ldd '{}' \; >> /tmp/runtime-libraries ;; \
+        arm64) \
+            ldd /usr/lib/chromium/chromium > /tmp/runtime-libraries; \
+            ldd /usr/lib/chromium/chromium-headless-shell >> /tmp/runtime-libraries ;; \
+    esac; \
+    find /usr/local/lib/node_modules/@luminati-io/luminati-proxy \
+        -type f -name '*.node' -exec ldd '{}' \; >> /tmp/runtime-libraries; \
+    if grep -q 'not found' /tmp/runtime-libraries; then \
+        cat /tmp/runtime-libraries; exit 1; \
+    fi; \
+    rm /tmp/chrome-path /tmp/runtime-libraries
+
+CMD ["luminati", "--help"]
